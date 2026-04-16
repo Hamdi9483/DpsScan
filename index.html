@@ -294,7 +294,8 @@
         <!-- تلميح الصيغة -->
         <div class="format-note">
             💡 الصيغة المطلوبة في QR:
-            <code>APPT|الاسم الكامل|رقم الجوال</code>
+            <code>PATIENT|ID:uuid|الاسم|رقم الهاتف</code>
+            <br><small style="opacity:0.8">(الصيغة القديمة APPT مدعومة أيضاً)</small>
         </div>
     </div>
 
@@ -389,7 +390,6 @@
                 currentLang = lang;
                 document.documentElement.lang = lang;
                 document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
-                // تحديث النصوص الثابتة
                 document.querySelector('.app-title p').textContent = lang === 'ar' ? 'تأكيد المواعيد عبر QR' : 'Confirm appointments via QR';
                 document.querySelector('.camera-overlay div').textContent = lang === 'ar' ? 'اضغط على زر الكاميرا للبدء' : 'Tap camera button to start';
                 document.querySelector('.raw-label span').textContent = lang === 'ar' ? 'البيانات المقروءة' : 'Scanned Data';
@@ -397,8 +397,8 @@
                 btnStop.innerHTML = `<i class="fas fa-stop"></i> ${t('stopCamera')}`;
                 manualInput.placeholder = lang === 'ar' ? '🔍 ابحث بالاسم أو رقم الهاتف...' : '🔍 Search by name or phone...';
                 document.querySelector('.format-note').innerHTML = lang === 'ar' 
-                    ? '💡 الصيغة المطلوبة في QR:<code>APPT|الاسم الكامل|رقم الجوال</code>' 
-                    : '💡 Expected QR format:<code>APPT|Full Name|PhoneNumber</code>';
+                    ? '💡 الصيغة المطلوبة في QR:<code>PATIENT|ID:uuid|الاسم|رقم الهاتف</code><br><small style="opacity:0.8">(الصيغة القديمة APPT مدعومة أيضاً)</small>'
+                    : '💡 Expected QR format:<code>PATIENT|ID:uuid|Full Name|PhoneNumber</code><br><small style="opacity:0.8">(Legacy APPT format also supported)</small>';
                 copyResultBtn.innerHTML = `<i class="fas fa-copy"></i> ${t('copy')}`;
                 if (rawContent.textContent.includes('انتظار')) rawContent.textContent = t('waiting');
                 else if (rawContent.textContent.includes('المسح') || rawContent.textContent.includes('Scanning')) rawContent.textContent = t('scanning');
@@ -417,10 +417,24 @@
             }
 
             // ---------- دوال Supabase ----------
-            async function findAppointment(name, phone) {
+            
+            // البحث المباشر بالـ UUID
+            async function findAppointmentById(uuid) {
+                if (!uuid) return null;
+                const { data, error } = await supabase
+                    .from('appointments')
+                    .select('*')
+                    .eq('id', uuid)
+                    .maybeSingle();
+                if (error) { console.error('Find by ID error:', error); return null; }
+                return data;
+            }
+
+            // البحث بالاسم أو الهاتف (للصيغة القديمة أو كخطة بديلة)
+            async function findAppointmentByNameOrPhone(name, phone) {
                 if (!name && !phone) return null;
                 let query = supabase.from('appointments').select('*');
-                if (phone && phone.length >= 7) {
+                if (phone && phone.length >= 3) { // دعم أرقام قصيرة
                     query = query.eq('phone', phone);
                 } else if (name) {
                     query = query.eq('patient_name', name);
@@ -476,7 +490,7 @@
                 resultCard.style.display = 'block';
             }
 
-            function showNotFound(name, phone) {
+            function showNotFound(extractedName, extractedPhone) {
                 statusIcon.className = 'status-icon fail';
                 statusIcon.innerHTML = '<i class="fas fa-times-circle"></i>';
                 resultTitle.textContent = t('noMatch');
@@ -485,7 +499,7 @@
                     <div class="detail-item full-width" style="background:rgba(239,71,111,0.1);">
                         <div class="detail-label">${currentLang==='ar'?'المستخرج':'Extracted'}</div>
                         <div style="font-family:monospace;padding:12px;background:var(--card-bg);border-radius:16px;">
-                            ${t('name')}: <b>${escapeHtml(name || '—')}</b><br>${t('phone')}: <b>${escapeHtml(phone || '—')}</b>
+                            ${t('name')}: <b>${escapeHtml(extractedName || '—')}</b><br>${t('phone')}: <b>${escapeHtml(extractedPhone || '—')}</b>
                         </div>
                     </div>
                 `;
@@ -498,11 +512,22 @@
                 return div.innerHTML;
             }
 
-            // ---------- عملية البحث والتأكيد ----------
-            async function processScan(name, phone, raw) {
+            // ---------- عملية البحث والتأكيد (تدعم UUID) ----------
+            async function processScan(uuid, name, phone, raw) {
                 rawContent.textContent = t('searching');
+                let record = null;
+                
                 try {
-                    const record = await findAppointment(name, phone);
+                    // 1. الأولوية للـ UUID إذا كان موجوداً
+                    if (uuid) {
+                        record = await findAppointmentById(uuid);
+                    }
+                    
+                    // 2. إذا لم يتم العثور، نبحث بالاسم أو الهاتف (للصيغة القديمة أو حالات خاصة)
+                    if (!record && (name || phone)) {
+                        record = await findAppointmentByNameOrPhone(name, phone);
+                    }
+                    
                     if (record) {
                         if (record.status === 'confirmed') {
                             showAlreadyScanned(record);
@@ -527,7 +552,7 @@
                 currentRawData = raw;
             }
 
-            // ---------- معالجة نجاح QR ----------
+            // ---------- معالجة نجاح QR (تحليل الصيغة الجديدة والقديمة) ----------
             function handleQRSuccess(rawData) {
                 scanning = false;
                 lastScannedCode = rawData;
@@ -535,15 +560,27 @@
                 rawBox.classList.add('active');
                 rawContent.textContent = rawData;
 
+                // تحليل الصيغة
                 const parts = rawData.split('|');
-                let qrName = '', qrPhone = '';
-                if (parts.length >= 3) {
+                let uuid = null, qrName = '', qrPhone = '';
+                
+                // الصيغة الجديدة: PATIENT|ID:uuid|الاسم|الهاتف
+                if (parts.length >= 3 && parts[0].toUpperCase() === 'PATIENT' && parts[1].toUpperCase().startsWith('ID:')) {
+                    uuid = parts[1].substring(3).trim(); // إزالة "ID:"
+                    qrName = parts[2] ? parts[2].trim() : '';
+                    qrPhone = parts[3] ? parts[3].trim().replace(/\D/g, '') : '';
+                }
+                // الصيغة القديمة: APPT|الاسم|الهاتف (أو أي نص آخر)
+                else if (parts.length >= 3 && parts[0].toUpperCase() === 'APPT') {
                     qrName = parts[1].trim();
                     qrPhone = parts[2].trim().replace(/\D/g, '');
-                } else {
+                }
+                // احتياط: نعتبر النص كاملاً اسماً
+                else {
                     qrName = rawData.trim();
                 }
-                processScan(qrName, qrPhone, rawData);
+                
+                processScan(uuid, qrName, qrPhone, rawData);
 
                 // استئناف المسح بعد 5 ثوان
                 setTimeout(() => {
@@ -622,7 +659,7 @@
                     rawContent.textContent = `${t('manualSearch')} ${value}`;
                     const cleanPhone = value.trim().replace(/\D/g, '');
                     const cleanName = value.trim();
-                    await processScan(cleanName, cleanPhone, value);
+                    await processScan(null, cleanName, cleanPhone, value);
                 }, 500);
             }
 
@@ -654,7 +691,6 @@
                 copyResultBtn.onclick = (e) => {
                     e.stopPropagation();
                     copyRawContent();
-                    // تعطيل الاستئناف التلقائي
                     copyResultBtn.dataset.pinned = '1';
                     setTimeout(() => { delete copyResultBtn.dataset.pinned; }, 30000);
                 };
